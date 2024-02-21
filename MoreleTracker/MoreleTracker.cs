@@ -6,6 +6,8 @@ using MoreleOutletTracker.MoreleTracker.PostGetJsonTemplates;
 using Newtonsoft.Json;
 using Serilog;
 using Serilog.Core;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Globalization;
 
 namespace MoreleOutletTracker.MoreleTracker
@@ -23,11 +25,49 @@ namespace MoreleOutletTracker.MoreleTracker
         }
     }
 
+    public class CounterManager
+    {
+        private int counter = 0;
+        private readonly object counterLock = new object();
+
+        public void IncrementCounter()
+        {
+            lock (counterLock)
+            {
+                counter++;
+            }
+        }
+
+        public void DecrementCounter()
+        {
+            lock (counterLock)
+            {
+                counter--;
+            }
+        }
+
+        public int GetCounter()
+        {
+            lock (counterLock)
+            {
+                return counter;
+            }
+        }
+    }
+
     public class MoreleTracker
     {
-        private static string baseApiUrl = "https://www.morele.net/api/widget/promotion_products/";
-        private static string productOutletApiUrlBase = "https://www.morele.net/api/product/getProductOutlet/";
+
+        private const uint outletPageRateLimit = 20;
+
+        private const string baseApiUrl = "https://www.morele.net/api/widget/promotion_products/";
+        private const string productOutletApiUrlBase = "https://www.morele.net/api/product/getProductOutlet/";
         public static CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+
+        //vars used only while checking outlet
+        static Dictionary<uint, Dictionary<string, string>> outletItemList = new Dictionary<uint, Dictionary<string, string>>(); //uint - globalProductId, 1st string - Product Name, 2nd string - Product Website Link
+        static List<Product> productsList = new List<Product>();
+
         public static async Task Initialize()
         {
             if (!JsonFM.CategoriesConfigExists())
@@ -64,14 +104,14 @@ namespace MoreleOutletTracker.MoreleTracker
 
             if (result.IsSuccessStatusCode && result.Content != null)
             {
-                List<Product> newProductsList = await GetProductsList(JsonConvert.DeserializeObject<MorelePostResponseData>(await result.Content.ReadAsStringAsync()).html);
+                await GetProductsList(JsonConvert.DeserializeObject<MorelePostResponseData>(await result.Content.ReadAsStringAsync()).html);
 
-                Log.Debug($"Found total amount of {newProductsList.Count} products");
+                Log.Debug($"Found total amount of {productsList.Count} products");
                 if (JsonFM.ProductFileExists())
                 {
                     if (Config.channelId != 0)
                     {
-                        await CompareFetchedProducts(newProductsList);
+                        await CompareFetchedProducts();
                     } else
                     {
                         Log.Warning("You don't have bot setted up on the server, use '/config setup' in order to have the bot check if new prodcuts has been added.");
@@ -80,7 +120,8 @@ namespace MoreleOutletTracker.MoreleTracker
                 {
                     JsonFM.CreateDirectory();
                 }
-                JsonFM.SaveProductListToFile(newProductsList);
+                JsonFM.SaveProductListToFile(productsList);
+                productsList.Clear();
             }
             else
             {
@@ -126,11 +167,8 @@ namespace MoreleOutletTracker.MoreleTracker
             JsonFM.SaveGeneratedCategoryConfigToFile(categoriesObject);
         }
 
-        private static async Task<List<Product>> GetProductsList(string postHtmlData)
+        private static async Task GetProductsList(string postHtmlData)
         {
-            Dictionary<uint, Dictionary<string, string>> outletItemList = new Dictionary<uint, Dictionary<string, string>>(); //uint - globalProductId, 1st string - Product Name, 2nd string - Product Website Link
-            List<Product> productsList = new List<Product>();
-
             var htmlDocument = new HtmlDocument();
             htmlDocument.LoadHtml(postHtmlData);
 
@@ -148,74 +186,99 @@ namespace MoreleOutletTracker.MoreleTracker
             }
             int totalCount = outletItemList.Count;
             Log.Information($"Found total of {totalCount} items");
-            uint processedCounter = 0;
+            CounterManager countmng = new CounterManager();
             foreach (uint itemId in outletItemList.Keys)
             {
-                processedCounter++;
-                var httpClient = new HttpClient();
-
-                var httpGetResponse = await httpClient.GetAsync(productOutletApiUrlBase + itemId.ToString());
-
-                if (!httpGetResponse.IsSuccessStatusCode)
-                {
-                    Log.Error($"Received Error {httpGetResponse.StatusCode} while requesting GET for Item with ID: {itemId}");
-                    continue;
-                }
-                var productHtml = JsonConvert.DeserializeObject<MoreleGetOutletResponseData>(await httpGetResponse.Content.ReadAsStringAsync()); //pain
-                if (productHtml.template == String.Empty) continue;
-
-                var productHtmlDoc = new HtmlDocument();
-                productHtmlDoc.LoadHtml(productHtml.template);
-
-                HtmlNodeCollection productsElement = productHtmlDoc.DocumentNode.SelectSingleNode("//div[@class='outlet-grid']").ChildNodes;
-
-                foreach (HtmlNode node in productsElement)
-                {
-                    if (node.Name != "div") continue;
-                    string thumbnailUrl = String.Empty;
-                    try
-                    {
-                        thumbnailUrl = node.SelectSingleNode(".//img").Attributes["src"].Value;
-                    } catch (Exception ex)
-                    {
-                        //no img lmao
-                    }
-                    Product product = new Product()
-                    {
-                        Id = Int32.Parse(node.SelectSingleNode(".//div[@class='ogi-id']").InnerHtml.Substring(4)),
-                        Name = outletItemList[itemId].Keys.First(),
-                        Condition = node.SelectSingleNode(".//div[@class='ogi-status font-semibold']").InnerText,
-                        Description = node.SelectSingleNode(".//div[@class='ogi-desc']").InnerHtml,
-                        oldPrice = float.Parse(new string(node.SelectSingleNode(".//div[@class='price-old']").InnerHtml.Where(c => char.IsDigit(c) || c == ',' || c == '.').ToArray()).Replace(',', '.')),
-                        newPrice = float.Parse(new string(node.SelectSingleNode(".//div[@class='price-new']").InnerHtml.Where(c => char.IsDigit(c) || c == ',' || c == '.').ToArray()).Replace(',', '.')), //at least it's more understanable than JS regex
-                        thumbnail = thumbnailUrl,
-                        link = outletItemList[itemId].Values.First()
-                    };
-
-                    productsList.Add(product);
-                }
+                GetProductOutletPageAndStuff(itemId, countmng);
             }
-            return productsList;
+
+            while (countmng.GetCounter() != 0)
+            {
+                await Task.Delay(1250);
+            }
+            outletItemList.Clear();
         }
 
-        private static async Task CompareFetchedProducts(List<Product> fetchedProducts)
+        private static async void GetProductOutletPageAndStuff(uint itemId, CounterManager countmngInstance)
+        {
+            countmngInstance.IncrementCounter();
+            Log.Information($"Invoke with current checks {countmngInstance.GetCounter()}");
+            var httpClient = new HttpClient();
+
+            var httpGetResponse = await httpClient.GetAsync(productOutletApiUrlBase + itemId.ToString());
+
+            while (!httpGetResponse.IsSuccessStatusCode)
+            {
+                CounterManager retryCounter = new CounterManager();
+                Log.Error($"Received Error {httpGetResponse.StatusCode} while requesting GET for Item with ID: {itemId} retrying...");
+                retryCounter.IncrementCounter();
+                await Task.Delay(850);
+                if (retryCounter.GetCounter() > 5)
+                {
+                    countmngInstance.DecrementCounter();
+                    return;
+                }
+            }
+            var productHtml = JsonConvert.DeserializeObject<MoreleGetOutletResponseData>(await httpGetResponse.Content.ReadAsStringAsync()); //pain
+            if (productHtml.template == String.Empty)
+            {
+                countmngInstance.DecrementCounter();
+                return;
+            }
+
+            var productHtmlDoc = new HtmlDocument();
+            productHtmlDoc.LoadHtml(productHtml.template);
+
+            HtmlNodeCollection productsElement = productHtmlDoc.DocumentNode.SelectSingleNode("//div[@class='outlet-grid']").ChildNodes;
+
+            foreach (HtmlNode node in productsElement)
+            {
+                if (node.Name != "div") continue;
+                string thumbnailUrl = String.Empty;
+                try
+                {
+                    thumbnailUrl = node.SelectSingleNode(".//img").Attributes["src"].Value;
+                }
+                catch (Exception ex)
+                {
+                    //no img lmao
+                }
+                Product product = new Product()
+                {
+                    Id = Int32.Parse(node.SelectSingleNode(".//div[@class='ogi-id']").InnerHtml.Substring(4)),
+                    Name = outletItemList[itemId].Keys.First(),
+                    Condition = node.SelectSingleNode(".//div[@class='ogi-status font-semibold']").InnerText,
+                    Description = node.SelectSingleNode(".//div[@class='ogi-desc']").InnerHtml,
+                    oldPrice = float.Parse(new string(node.SelectSingleNode(".//div[@class='price-old']").InnerHtml.Where(c => char.IsDigit(c) || c == ',' || c == '.').ToArray()).Replace(',', '.')),
+                    newPrice = float.Parse(new string(node.SelectSingleNode(".//div[@class='price-new']").InnerHtml.Where(c => char.IsDigit(c) || c == ',' || c == '.').ToArray()).Replace(',', '.')), //at least it's more understanable than JS regex
+                    thumbnail = thumbnailUrl,
+                    link = outletItemList[itemId].Values.First()
+                };
+
+                productsList.Add(product);
+            }
+            countmngInstance.DecrementCounter();
+            Log.Information($"Invoke finished current checks {countmngInstance.GetCounter()}");
+        }
+
+        private static async Task CompareFetchedProducts()
         {
             List<Product> productsFromFile = JsonFM.RetrieveProductsFromFile();
 
-            foreach (Product fetchedProduct in fetchedProducts)
+            foreach (Product fetchedProduct in productsList)
             {
-                CheckProduct(fetchedProduct, productsFromFile);
+                await CheckProduct(fetchedProduct, productsFromFile);
             }
 
         }
 
-        private static async void CheckProduct(Product fetchedProduct, List<Product> productsFromFile)
+        private static async Task CheckProduct(Product fetchedProduct, List<Product> productsFromFile)
         {
             Log.Information($"started check for {fetchedProduct.Id}");
             bool existsInFile = false;
             foreach (Product localProduct in productsFromFile)
             {
-                if (fetchedProduct.Id == localProduct.Id)
+                if (productsFromFile.Contains(localProduct))
                 {
                     existsInFile = true;
                     break;
