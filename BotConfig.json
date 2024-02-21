@@ -1,0 +1,6 @@
+{
+  "token": "your token",
+  "channelId": 0,
+  "mentionRoleId": 0,
+  "fetchCooldown": 5 //in minutes
+}
